@@ -311,7 +311,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
 
     nvcc_flags = [
     "-O3",
-    "-std=c++17",
+    "-std=c++20",  # Modified by yLLM: torch 2.14's headers use C++20 (requires-clauses in ATen/core/TensorBase.h); upstream PR 2872 does the same
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -330,7 +330,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # "-DFLASHATTENTION_DISABLE_LOCAL",
     ]
 
-    compiler_c17_flag=["-O3", "-std=c++17"]
+    compiler_c17_flag=["-O3", "-std=c++20"]  # Modified by yLLM: C++20 for the host compile of the CUDA build (torch 2.14)
     # Add Windows-specific flags
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
