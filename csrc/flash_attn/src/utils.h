@@ -1,5 +1,10 @@
 /******************************************************************************
  * Copyright (c) 2023, Tri Dao.
+ * Modified by yLLM: resolve_thread_kv_page_slice_offset and the thread-tile reshape helpers
+ *   for paged KV pages of 16 tokens,
+ *   ported from vLLM's fork of FlashAttention (vllm-project/flash-attention, commits
+ *   90eacc1af2a7c3de62ea249e929ed5faccf38954 and 720c94869cf2e0ff5a706e9c7f1dce0939686ade,
+ *   BSD-3-Clause per that fork's LICENSE; see NOTICE-YLLM.md at the repository root).
  ******************************************************************************/
 
 #pragma once
@@ -7,6 +12,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <optional>
 
 #include <cuda_fp16.h>
 
@@ -289,6 +295,70 @@ void cp_async_wait() {
 #if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// resolves offset of a slice of a paged kv copy from gmem.
+// assumes that the tensor has already been positioned at the correct head.
+template <typename Kernel_traits>
+__forceinline__ __device__
+int64_t resolve_thread_kv_page_slice_offset(
+    const int tidx, const int n_block, const int page_block_size,
+    const int* block_table, const int page_stride, const int row_stride,
+    std::optional<int> partial_block_size = std::nullopt
+) {
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+
+    const int64_t col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;
+    int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
+
+    if (partial_block_size) {
+        // if we have a partial block, we need to adjust the row offset to avoid
+        // reading of the end end of the block_table
+        // get the offset of the last row in the kBlockN we care about
+        auto final_row_offset = std::max(*partial_block_size - 1, 0);
+        // adjust the row offset to account for each thread loading multiple
+        // rows
+        auto final_thread_row_offset =
+          ceil_div(final_row_offset, kGmemRowsPerThread) * kGmemRowsPerThread;
+        block_row_offset = std::min(
+            block_row_offset, int64_t(final_thread_row_offset));
+    }
+
+    const int64_t global_row_offset = block_row_offset + n_block * kBlockN;
+    const int64_t page_offset = global_row_offset % page_block_size;
+    const int64_t virtual_page_idx = global_row_offset / page_block_size;
+
+    return ((int64_t) block_table[virtual_page_idx]) * ((int64_t) page_stride)
+        + page_offset * ((int64_t) row_stride)
+        + col_offset;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Layout reshape function. Given a layout with modes ((v1, v2), m, k), returns (v1, v2, k),
+// where v2 may be a tuple itself, in the case of swizzled smem-backed thread tiles. This ensures
+// that paged and non-paged copies result in equivalently shaped, if not necessarily strided, tensors.
+template <class Shape, class Stride>
+__forceinline__ __device__
+auto reshape_thread_tile(Layout<Shape, Stride> l) {
+    return make_layout(append(get<0>(l.shape()), get<2>(l.shape())),
+                        append(get<0>(l.stride()), get<2>(l.stride())));
+}
+
+// reshapes and flattens the thread tile layout. A separate function is needed for the case where
+// one of the modes of l is a layout itself and must be flattened, as opposed to keeping it intact
+// for the case of swizzled layouts
+template <class Shape, class Stride>
+__forceinline__ __device__
+auto reshape_flatten_thread_tile(Layout<Shape, Stride> l) {
+    auto mode_0 = filter(flatten(get<0>(l)));
+    return make_layout(append(mode_0.shape(), get<2>(l.shape())),
+                        append(mode_0.stride(), get<2>(l.stride())));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
